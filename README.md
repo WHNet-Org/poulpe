@@ -11,8 +11,10 @@ Poulpe is a stateful remote access platform that runs entirely in the browser. C
 - **Stateful Sessions**: Close your tab, switch devices, resume exactly where you left off
 - **Multi-Tenancy**: Organizations, workspaces, and folder hierarchies for access segregation
 - **Multi-OIDC**: Email-based identity provider discovery with per-organization SSO configuration
-- **Fine-Grained RBAC**: Groups, roles, and permissions down to individual connections
+- **ReBAC Authorization**: Fine-grained relationship-based access control with hierarchical inheritance (powered by OpenFGA)
 - **VS Code-Inspired UI**: Familiar panels, tabs, and tree navigation
+- **Poulpe Support**: One-click remote assistance with mandatory user consent
+- **Kubernetes-Native**: Production-ready Helm charts with clustering and HA support
 
 ## Architecture
 
@@ -27,11 +29,12 @@ Poulpe is a stateful remote access platform that runs entirely in the browser. C
 └─────────────────────────────────┬───────────────────────────────────┘
                                   │
 ┌─────────────────────────────────┴───────────────────────────────────┐
-│                         Poulpe Server (Go)                           │
+│                    Poulpe Server Cluster (Go)                        │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐             │
-│  │ REST API │  │   Auth   │  │   RBAC   │  │  Events  │             │
+│  │ REST API │  │   Auth   │  │  ReBAC   │  │  Events  │             │
 │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘             │
 │       └─────────────┴─────────────┴─────────────┘                    │
+│            Redis (Cluster Coordination) + PostgreSQL                 │
 │                              gRPC                                    │
 └─────────────────────────────────┬───────────────────────────────────┘
                                   │
@@ -42,7 +45,7 @@ Poulpe is a stateful remote access platform that runs entirely in the browser. C
 │  │ (stdlib) │  │(IronRDP) │  │  (RFB)   │  │ (Rust)   │             │
 │  └──────────┘  └──────────┘  └──────────┘  └──────────┘             │
 │                        Rust Bridge (FFI)                             │
-│            Screen Capture: DXGI (Win) / X11 (Linux)                  │
+│     Screen Capture: DXGI (Win) / X11 (Linux) / AVFoundation (Mac)    │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -54,18 +57,42 @@ Poulpe is a stateful remote access platform that runs entirely in the browser. C
 - Multi-OIDC authentication with email-based provider discovery
 - PostgreSQL for state, Redis for clustering
 - Session routing and WebSocket relay
+- Embedded OpenFGA authorization engine
 
 **Tentacle Agent** (`cmd/tentacle/`)
 - Connects to targets via SSH, RDP, VNC, or local screen capture
 - Maintains persistent connections and buffers output
-- Rust FFI bridge for RDP (IronRDP) and screen capture (DXGI/X11)
+- Rust FFI bridge for RDP (IronRDP) and screen capture (DXGI/X11/AVFoundation)
 - Reports health metrics back to server
+- Multiple operational modes: standard, service (Windows), and embedded (Poulpe support)
+
+**Poulpe Support** (`cmd/tentacle-support/`)
+- Pre-configured binary for one-click remote assistance
+- Cross-platform GUI (Fyne toolkit)
+- Mandatory user consent with configurable timeout
+- Auto-generated sessions with expiration
+
+**CLI Tools** (`cmd/poulpectl/`, `cmd/gateway/`)
+- `poulpectl`: Server management, migrations, organization management
+- `gateway`: Native RDP/SSH client gateway (RD Gateway protocol)
 
 **Web Frontend** (`web/`)
 - React SPA with VS Code-inspired layout
 - xterm.js for terminal rendering
 - Binary protocol handling for RDP/VNC frames
 - Real-time WebSocket events for session health
+
+## Binaries
+
+| Binary | Description |
+|--------|-------------|
+| `poulpe-server` | Central coordination server |
+| `tentacle` | Full-featured agent (all protocols + service mode) |
+| `tentacle-host` | Lightweight agent (host protocol only) |
+| `tentacle-support` | Poulpe support with GUI (embedded mode) |
+| `poulpectl` | CLI management tool (migrations, orgs, authz) |
+| `gateway` | Native RDP/SSH client gateway |
+| `poulpe-updater` | Windows self-update helper |
 
 ## Protocol Implementation
 
@@ -74,8 +101,8 @@ Poulpe is a stateful remote access platform that runs entirely in the browser. C
 | SSH | Go `x/crypto/ssh` | Pure Go, no dependencies |
 | RDP | IronRDP (Rust) | FFI bridge, CredSSP auth |
 | VNC | RFB (Go) | Native implementation |
-| Host | Rust + OS APIs | DXGI (Windows), X11 (Linux) |
-| Web | Chromium + VNC | Docker container orchestration (Kubernetes coming soon) |
+| Host | Rust + OS APIs | DXGI (Windows), X11 (Linux), AVFoundation (macOS) |
+| Web | Chromium + VNC | Container orchestration (Docker Compose or Kubernetes) |
 
 All protocol handling is baked into the binaries. No external tools like `xfreerdp`, `ssh`, or `x11vnc` required.
 
@@ -97,11 +124,12 @@ Sessions live on the Tentacle, not in the browser:
 - Email domain-based provider discovery
 - Session tracking with revocation support
 
-**Authorization**
-- Hierarchical folder permissions with inheritance
-- Grant or deny actions: `view`, `connect`, `edit`, `delete`, `manage`
-- Assignable to users, groups, or roles
-- Priority-based evaluation for conflict resolution
+**Authorization (ReBAC)**
+- Relationship-Based Access Control powered by embedded OpenFGA
+- Hierarchical permissions with inheritance (organization → folder → resource)
+- Actions: `view`, `connect`, `edit`, `delete`, `manage`, `view_secrets`
+- Assignable to users or OIDC groups
+- Computed permissions via relationship graph traversal
 
 **Encryption**
 - Credentials encrypted at rest (AES-256-GCM)
@@ -136,18 +164,77 @@ The Tentacle agent achieves true cross-platform support:
 - Service mode with per-user session agents
 - DXGI Desktop Duplication for screen capture
 - Windows.Graphics.Capture API (modern)
+- UAC elevation helper for admin operations
 
 **Linux** ✅ Fully supported
 - X11 display capture via `scrap` crate
 - Input injection via `enigo`/xdotool
 
-**macOS** ⚠️ Remote protocols only
-- SSH, RDP, and VNC protocols work (pure Go/Rust, no OS dependencies)
-- **Host protocol not implemented** — no local screen capture/remote control
-- The architecture is designed for macOS Host support (Screen Capture framework + Accessibility APIs), but we lack access to Apple hardware for development and testing
-- Contributions welcome!
+**macOS** ✅ Fully supported
+- SSH, RDP, and VNC protocols (pure Go/Rust)
+- Host protocol via AVFoundation screen capture
+- Input injection via Core Graphics
 
 No external dependencies beyond OS-provided APIs.
+
+## Poulpe Support (Remote Assistance)
+
+Poulpe includes a one-click remote assistance feature for help desk scenarios:
+
+1. **Generate Download Link**: Support agent creates a time-limited support session in the UI
+2. **User Downloads Binary**: End user downloads a pre-configured `tentacle-support` binary
+3. **Consent Required**: Binary displays a GUI requiring explicit user consent before screen sharing
+4. **Session Expires**: Support sessions automatically expire and clean up
+
+Features:
+- Cross-platform GUI (Windows, Linux, macOS) using Fyne toolkit
+- Mandatory consent with configurable timeout (default: 30 seconds)
+- Real-time status display showing connection state and session info
+- Automatic binary cleanup after session ends
+
+## Production Deployment
+
+### Kubernetes (Recommended)
+
+Helm charts are provided in `deployments/helm/`:
+
+```bash
+# Add repo and install
+helm repo add poulpe https://your-registry/helm/stable
+helm install poulpe poulpe/poulpe \
+  --set secrets.jwtSecret=$(openssl rand -base64 32) \
+  --set secrets.credentialKek=$(openssl rand -base64 32) \
+  --set postgresql.auth.password=your-secure-password \
+  --set appUrl=https://poulpe.example.com
+```
+
+Key capabilities:
+- **StatefulSet deployment** with stable pod identities
+- **Redis-based cluster coordination** for multi-server deployments
+- **Affinity routing** for WebSocket session stickiness
+- **Migration jobs** as Helm hooks
+- **PostgreSQL HA** with failover support
+- **Redis Cluster/Sentinel** modes for HA
+
+See `deployments/helm/poulpe/README.md` for full configuration options.
+
+### Clustering
+
+Poulpe uses a cluster-first architecture. Even single-server deployments run as 1-node clusters:
+
+- **Server Registry**: Each server registers with Redis and sends heartbeats
+- **Tentacle Assignment**: Tentacles are assigned to specific servers; sessions route accordingly
+- **Dead Server Detection**: Servers missing heartbeats are cleaned up; tentacles reassigned
+- **Health Monitoring**: Servers terminate if Redis/PostgreSQL connectivity is lost (prevents split-brain)
+
+Configuration:
+```bash
+POULPE_CLUSTER_ENABLED=true
+POULPE_CLUSTER_SERVER_ID=poulpe-1
+POULPE_CLUSTER_SERVER_ADDR=poulpe-1:8080
+POULPE_CLUSTER_HEARTBEAT_INTERVAL=5s
+POULPE_CLUSTER_DEAD_THRESHOLD=15s
+```
 
 ## Quick Start
 
@@ -170,8 +257,8 @@ make build
 cp .env.example .env
 # Edit .env with your database and OIDC settings
 
-# Run migrations
-make migrate-up
+# Run migrations (includes OpenFGA schema)
+./bin/poulpectl migrate up
 
 # Start server
 ./bin/poulpe-server
@@ -185,6 +272,9 @@ make build-tentacle
 
 # Run with registration token
 ./bin/tentacle --server your-server:9090 --token <registration-token>
+
+# Or install as Windows service
+./bin/tentacle service install --server your-server:9090 --token <registration-token>
 ```
 
 ### Frontend
@@ -202,11 +292,41 @@ Key environment variables:
 | Variable | Description |
 |----------|-------------|
 | `DATABASE_URL` | PostgreSQL connection string |
+| `REDIS_URL` | Redis connection string |
 | `JWT_SECRET` | Secret for JWT signing |
 | `CREDENTIAL_KEK` | Key encryption key for credentials |
 | `POULPE_WEB_DIR` | Path to built frontend |
+| `POULPE_CLUSTER_ENABLED` | Enable multi-server clustering |
+| `POULPE_SUPPORT_ENABLED` | Enable Poulpe support feature |
 
-See `.env.example` for full configuration options.
+See `.env.example` for full configuration options including:
+- PostgreSQL HA (multi-host failover, read replicas)
+- Redis Cluster and Sentinel modes
+- OpenFGA authorization tuning
+- Rate limiting
+- Gateway configuration
+
+## CLI Management
+
+`poulpectl` provides administrative commands:
+
+```bash
+# Migrations
+poulpectl migrate up        # Apply all pending migrations
+poulpectl migrate down      # Rollback last migration
+poulpectl migrate status    # Show migration status
+
+# OpenFGA
+poulpectl openfga migrate   # Run OpenFGA migrations only
+poulpectl openfga sync      # Rebuild OpenFGA state from database
+
+# Organizations
+poulpectl org list                          # List organizations
+poulpectl org members <org>                 # List members
+poulpectl org set-role <org> <email> admin  # Change role
+poulpectl org add-member <org> <email> member
+poulpectl org remove-member <org> <email>
+```
 
 ## Why Poulpe?
 
@@ -217,8 +337,11 @@ See `.env.example` for full configuration options.
 | **Self-hosted** | Yes | Yes | Yes/Cloud | Cloud only |
 | **Multi-tenant** | Native | Manual | Enterprise | Enterprise |
 | **OIDC discovery** | Per-email domain | Single provider | Single provider | Native |
+| **Authorization** | ReBAC (OpenFGA) | Role-based | Role-based | Policy-based |
 | **Agent dependencies** | Tentacle (single binary) | guacd + libs | teleport binary | cloudflared |
 | **Cross-platform agent** | Linux, Windows, macOS | Linux only (guacd) | Linux, Windows, macOS | Linux, Windows, macOS |
+| **Poulpe Support** | Built-in GUI | No | No | No |
+| **Kubernetes native** | Helm charts included | Community charts | Yes | N/A |
 
 *Teleport's Windows access uses a custom protocol over WebSocket, not native RDP. No VNC support.
 
